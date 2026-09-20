@@ -76,15 +76,31 @@ One account, both sites. The sign-in form here checks the password against the
 same `users` row mzazi.shop checks, and issues the same cookie: name `token`, JWT
 claims `{ userId, email }`, seven days, `httpOnly`, `SameSite=Lax`.
 
-**`JWT_SECRET` must be the same value on both deployments.** That is what makes a
-session issued on one site understood by the other, and it is the only shared
-secret this site needs.
-
 The form is here rather than a link to mzazi.shop because a cookie belongs to a
 domain: a session created there is never sent to this one. Signing in here mints
 this site's own cookie against the same account — so the credentials, the devices
 and the plan are all the same, while account creation, plans and the wallet stay
 on the main site, one source of truth each.
+
+### The signing key looks after itself
+
+Sessions are signed with a key that comes from, in order:
+
+1. **`JWT_SECRET`, when it is set.** The better answer when the value is known,
+   because the platform and this site then share a key and a session issued by
+   either is accepted by both.
+2. **A key this site generates and keeps in the `settings` table.** Nothing to
+   configure, nothing to remember, and sessions survive restarts and deploys.
+
+Requiring `JWT_SECRET` was a mistake worth undoing: the platform generated that
+value once and rarely looks at it again, so asking for it to deploy a second site
+turned "I cannot remember it" into "I cannot sign in". **Only `DATABASE_URL` is
+required.** Setting `JWT_SECRET` later upgrades to shared sessions with no code
+change; existing visitors sign in once more, and that is the whole cost.
+
+What changes without it: the key is this site's own, so a session minted here is
+not accepted by the platform, nor the reverse. The shared thing that matters is the
+account — same row, same credentials, same devices — and that is unaffected.
 
 ---
 
@@ -96,17 +112,17 @@ cp .env.example .env.local   # then fill it in
 npm run dev                  # http://localhost:3000
 ```
 
-| Variable | Purpose |
-|---|---|
-| `DATABASE_URL` | The platform's Neon connection string — the same database mzazi.shop and the bots use. Copy it from the Neon dashboard's connection details. |
-| `JWT_SECRET` | The session secret. **The same value as the platform's**, or sessions will not be shared. `openssl rand -base64 32` generates one. |
-| `NEXT_PUBLIC_SITE_URL` | This site's public address — canonical URLs, the sitemap, shares. |
-| `NEXT_PUBLIC_MZAZI_SITE` | The main site, for account creation and plans. |
+| Variable | Required | Purpose |
+|---|---|---|
+| `DATABASE_URL` | **yes** | The platform's Neon connection string — the same database mzazi.shop and the bots use. |
+| `JWT_SECRET` | no | Signs sessions. Set it to the platform's value to share sessions between the sites; leave it empty and this site generates and keeps its own. See above. |
+| `NEXT_PUBLIC_SITE_URL` | no | This site's public address — canonical URLs, the sitemap, shares. Has a default. |
+| `NEXT_PUBLIC_MZAZI_SITE` | no | The main site, for account creation and plans. Has a default. |
 
 Only the two `NEXT_PUBLIC_` values are readable by the browser, and neither is a
-secret. `DATABASE_URL` and `JWT_SECRET` are server-only, are read in exactly one
-place each (`lib/db.js`, `lib/session.js`), and never appear in `lib/site.js` —
-which client components import.
+secret. `DATABASE_URL` is read in exactly one place (`lib/db.js`) and `JWT_SECRET`
+in one other (`lib/sessionSecret.js`), and neither appears in `lib/site.js` — which
+client components import.
 
 ### `GET /api/health`
 
@@ -116,12 +132,17 @@ whether the database answered, and which tables it found:
 
 ```json
 { "ok": true,
-  "config": { "databaseUrl": "set", "jwtSecret": "set", "nodeEnv": "production" },
+  "config": { "databaseUrl": "set",
+              "sessionKey": "self-managed, stored in the database",
+              "nodeEnv": "production" },
   "database": { "reachable": true, "name": "neondb" },
-  "tables": { "auth": { "present": ["users","bot_control","bot_status","settings"], "missing": [] } },
+  "tables": { "signIn": { "present": ["users"], "missing": [] },
+              "pairing": { "present": ["bot_control","bot_status","settings"], "missing": [] } },
   "verdict": "Sign-in and pairing should both work." }
 ```
 
+`sessionKey` reports **which** key is signing sessions and never its value:
+`JWT_SECRET (shared with the platform)` or `self-managed, stored in the database`.
 A missing `users` table means `DATABASE_URL` points at a new Neon project rather
 than the platform database, and it says so.
 
@@ -130,7 +151,7 @@ than the platform database, and it says so.
 ## Checking it
 
 ```bash
-npm run test     # 113 assertions, no network, no database
+npm run test     # 126 assertions, no network, no database
 npm run build    # compiles and type-checks every route
 ```
 
@@ -142,6 +163,10 @@ It covers:
 
 - **the session cookie**: its name, attributes, seven-day life, and that the JWT
   carries `userId` and `email` — the claims the platform's own routes read
+- **the signing key**: that `JWT_SECRET` is used when set, that a stored key is
+  read rather than regenerated, that a first boot generates one, stores it under a
+  namespaced key without overwriting an existing one, and caches it in the process
+  — and that with neither source available the error names both ways out
 - **the pairing queue**: that an insert writes `action='pair'`, `status='pending'`
   and a payload carrying the number and account; that an unnamed request stays
   untargeted so any bot may claim it; that a request is only readable by the
@@ -171,9 +196,10 @@ serves, not invented. If the pack changes size, update `COMMAND_GROUPS` in
 
 ## Deploying
 
-Anywhere that runs Next.js. On Vercel: import the repository, set the four
-environment variables, deploy. Nothing else to provision — the database and the bot
-stay where they are.
+Anywhere that runs Next.js. On Vercel: import the repository, set `DATABASE_URL`
+(and the two public URLs if the defaults are not right), deploy. Nothing else to
+provision — the database and the bot stay where they are, and the session key looks
+after itself.
 
 Then, in order:
 

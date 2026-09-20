@@ -1,25 +1,30 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/health — "why can I not sign in?"
 //
-// This site's login depends on exactly three things: DATABASE_URL, JWT_SECRET, and
-// a database that already holds the platform's tables. When any of them is wrong
-// the sign-in form can only say that it failed, so this endpoint says which one.
+// This site's sign-in depends on a database and a signing key. The database comes
+// from DATABASE_URL; the signing key comes from JWT_SECRET if that is set, and
+// otherwise from a key this site keeps for itself (lib/sessionSecret.js). So there
+// is no longer a variable anybody has to remember, and this endpoint reports which
+// of the two sources is actually in use.
 //
-// It is safe to leave public. It reports whether each variable is SET and never
-// its value, and the only database facts it exposes are the names of tables that
-// had to exist for the site to be running at all.
+// It is safe to leave public. It reports whether a variable is SET and never its
+// value, and the only database facts it exposes are the names of tables that had
+// to exist for the site to be running at all.
 //
 //   GET /api/health → 200 when sign-in should work, 503 when it cannot.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { NextResponse } from 'next/server';
 import { db, hasDatabaseUrl, describeDbError } from '@/lib/db';
+import { sessionSecretSource } from '@/lib/sessionSecret';
 
 export const dynamic = 'force-dynamic';
 
-// The tables a sign-in actually touches. Checked by name so the report can say
-// WHICH one is missing rather than "a query failed".
-const REQUIRED_TABLES = ['users', 'bot_control', 'bot_status', 'settings'];
+// What sign-in needs, and what pairing needs on top of it. Grouped, because one
+// missing table in the second group should not be reported as "you cannot sign in".
+const SIGN_IN_TABLES = ['users'];
+const PAIRING_TABLES = ['bot_control', 'bot_status', 'settings'];
+// The bot-side tables, joined to a site account by User.telegramId.
 const ACCOUNT_TABLES = ['User', 'Subscription', 'WhatsAppSession'];
 
 async function checkTables(sql, names) {
@@ -39,7 +44,12 @@ export async function GET() {
     ok: false,
     config: {
       databaseUrl: hasDatabaseUrl() ? 'set' : 'MISSING',
-      jwtSecret: process.env.JWT_SECRET ? 'set' : 'MISSING',
+      // Refined below, once the database can be asked. Without JWT_SECRET this is
+      // not a problem to report — it is the self-managed path — so it must not
+      // read like one.
+      sessionKey: process.env.JWT_SECRET
+        ? 'JWT_SECRET (shared with the platform)'
+        : 'self-managed — read from the database below',
       nodeEnv: process.env.NODE_ENV || 'development',
     },
     database: null,
@@ -48,18 +58,15 @@ export async function GET() {
   };
 
   if (!hasDatabaseUrl()) {
-    report.verdict = 'DATABASE_URL is not set on this deployment, so nothing can sign in. Add the platform Neon connection string.';
-    return NextResponse.json(report, { status: 503 });
-  }
-  if (!process.env.JWT_SECRET) {
-    report.verdict = 'JWT_SECRET is not set, so no session can be issued or trusted. Use the same value as the platform site.';
+    report.config.sessionKey = 'unavailable — needs DATABASE_URL to keep one of its own';
+    report.verdict =
+      'DATABASE_URL is not set on this deployment, so nothing can sign in. Add the platform Neon connection string; the session key looks after itself once it is there.';
     return NextResponse.json(report, { status: 503 });
   }
 
   try {
     const sql = db();
     const ping = await sql`SELECT current_database() AS name, now() AS at`;
-
     report.database = {
       reachable: true,
       name: ping[0]?.name || null,
@@ -72,24 +79,43 @@ export async function GET() {
     return NextResponse.json(report, { status: 503 });
   }
 
+  // Which key is in use. Deliberately reported as a source and never as a value —
+  // "self-managed in the database" is the answer a deployment without JWT_SECRET
+  // should give, and it is a working answer.
+  const source = await sessionSecretSource();
+  report.config.sessionKey =
+    source === 'environment' ? 'JWT_SECRET (shared with the platform)'
+      : source === 'database' ? 'self-managed, stored in the database'
+        : 'unavailable';
+
   try {
     const sql = db();
-    const auth = await checkTables(sql, REQUIRED_TABLES);
+    const signIn = await checkTables(sql, SIGN_IN_TABLES);
+    const pairing = await checkTables(sql, PAIRING_TABLES);
     const account = await checkTables(sql, ACCOUNT_TABLES);
 
-    report.tables = { auth, account };
+    report.tables = { signIn, pairing, account };
 
-    // Missing auth tables stop sign-in; missing account tables only stop the
-    // device list, which is a narrower problem and reported as such.
-    if (auth.missing.length) {
-      report.verdict = `The database is reachable but has no ${auth.missing.join(', ')} table — this must point at the platform database, not a new one.`;
+    if (signIn.missing.length) {
+      report.verdict = `The database is reachable but has no ${signIn.missing.join(', ')} table — this must point at the platform database, not a new one.`;
+      return NextResponse.json(report, { status: 503 });
+    }
+
+    if (source === 'unavailable') {
+      report.verdict =
+        'The database is fine, but no session key could be read or created — check the connection can write to the settings table.';
       return NextResponse.json(report, { status: 503 });
     }
 
     report.ok = true;
-    report.verdict = account.missing.length
-      ? `Sign-in should work. Pairing will report no devices until the ${account.missing.join(', ')} table exists.`
-      : 'Sign-in and pairing should both work.';
+
+    if (pairing.missing.length) {
+      report.verdict = `Sign-in works. Pairing will not: the ${pairing.missing.join(', ')} table is missing.`;
+    } else if (account.missing.length) {
+      report.verdict = `Sign-in works and pairing can be queued. The device list stays empty until the ${account.missing.join(', ')} table exists.`;
+    } else {
+      report.verdict = 'Sign-in and pairing should both work.';
+    }
 
     return NextResponse.json(report, { status: 200 });
   } catch (e) {

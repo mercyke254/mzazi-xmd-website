@@ -168,11 +168,16 @@ console.log('\nMZAZI XMD website\n');
     }),
   };
   const fake = fakeDb();
+  // The signing key comes from lib/sessionSecret.js: JWT_SECRET when set, and a
+  // key this site keeps in the database when not. Here it is set, so the token is
+  // signed with the value the platform would also be using.
+  const secretModule = { getSessionSecret: async () => ({ secret: process.env.JWT_SECRET, source: 'environment' }) };
   const { startSession, endSession, sessionClaims } =
     loadEsm('lib/session.js', ['startSession', 'endSession', 'sessionClaims'], {
       'jsonwebtoken': jwt,
       'next/headers': cookiesStub,
       './db': fake.module,
+      './sessionSecret': secretModule,
     });
 
   const user = { id: 42, email: 'demo@example.com' };
@@ -201,6 +206,7 @@ console.log('\nMZAZI XMD website\n');
     'jsonwebtoken': jwt,
     'next/headers': { cookies: async () => ({ get: () => ({ value: 'not.a.jwt' }) }) },
     './db': fake.module,
+    './sessionSecret': secretModule,
   });
   check('a forged cookie is not a session', (await claimsWithBadCookie()) === null);
 
@@ -208,6 +214,7 @@ console.log('\nMZAZI XMD website\n');
     'jsonwebtoken': jwt,
     'next/headers': { cookies: async () => ({ get: () => undefined }) },
     './db': fake.module,
+    './sessionSecret': secretModule,
   });
   check('no cookie is not a session', (await claimsWithoutCookie()) === null);
 }
@@ -393,6 +400,94 @@ console.log('\nMZAZI XMD website\n');
   check('an unknown error still says something', !!describeDbError({}).reason);
 }
 
+// ── 7b. The signing key looks after itself ──────────────────────────────────
+// The point of this module: deploying a second site must not require finding a
+// value the platform generated once and nobody wrote down.
+{
+  console.log('\n7b. The signing key needs no configuration');
+
+  const { randomBytes } = require('crypto');
+  const load = (deps) => loadEsm(
+    'lib/sessionSecret.js',
+    ['getSessionSecret', 'sessionSecretSource', 'resetSessionSecretCache', 'SESSION_SECRET_SETTING_KEY'],
+    deps
+  );
+
+  const original = process.env.JWT_SECRET;
+
+  // 1. JWT_SECRET set → used, and reported as coming from there.
+  {
+    process.env.JWT_SECRET = 'test-fixture-from-the-environment';
+    const mod = load({ './db': fakeDb().module, crypto: { randomBytes } });
+    mod.resetSessionSecretCache();
+    const got = await mod.getSessionSecret();
+    check('JWT_SECRET is used when it is set', got.secret === 'test-fixture-from-the-environment');
+    check('and it is reported as coming from the environment', got.source === 'environment');
+  }
+
+  // 2. Not set, a key already stored → read, not regenerated.
+  {
+    delete process.env.JWT_SECRET;
+    const stored = 'a'.repeat(64);
+    const fake = fakeDb((q) => (/FROM settings/.test(q) ? [{ value: stored }] : []));
+    const mod = load({ './db': fake.module, crypto: { randomBytes } });
+    mod.resetSessionSecretCache();
+    const got = await mod.getSessionSecret();
+    check('a stored key is used when the variable is not set', got.secret === stored);
+    check('and it is reported as self-managed', got.source === 'database');
+    check('nothing is written when a key is already there',
+      !fake.calls.some((c) => /INSERT INTO settings/.test(c.query)));
+  }
+
+  // 3. Not set, nothing stored → generate, store, reuse. This is the first-boot
+  //    path on a deployment where nobody knows the platform's secret.
+  {
+    delete process.env.JWT_SECRET;
+    let stored = null;
+    const fake = fakeDb((q) => {
+      if (/INSERT INTO settings/.test(q)) { stored = q.match(/[0-9a-f]{64}/)?.[0] || null; return []; }
+      if (/FROM settings/.test(q)) return stored ? [{ value: stored }] : [];
+      return [];
+    });
+    const mod = load({ './db': fake.module, crypto: { randomBytes } });
+    mod.resetSessionSecretCache();
+    const got = await mod.getSessionSecret();
+
+    check('a key is generated when there is none', /^[0-9a-f]{64}$/.test(got.secret), got.secret?.slice(0, 12));
+    check('it is stored so it survives a restart',
+      fake.calls.some((c) => /INSERT INTO settings/.test(c.query)));
+    check('it is stored under a namespaced key',
+      fake.calls.some((c) => c.values?.includes('xmd_website_session_secret')));
+    check('the insert does not overwrite an existing key', /WHERE NOT EXISTS/.test(fake.calls.find((c) => /INSERT/.test(c.query))?.query || ''));
+    check('the generated key is 32 bytes of entropy', got.secret.length === 64);
+
+    // A second call must not go back to the database: this sits on the path of
+    // every authenticated request.
+    const before = fake.calls.length;
+    const again = await mod.getSessionSecret();
+    check('the key is cached in the process', fake.calls.length === before && again.secret === got.secret);
+  }
+
+  // 4. Neither source available → a message that names both ways out.
+  {
+    delete process.env.JWT_SECRET;
+    const failing = {
+      db: () => { throw Object.assign(new Error('DATABASE_URL is not set'), { isConfig: true }); },
+      hasDatabaseUrl: () => false,
+      ConfigError: class ConfigError extends Error {},
+    };
+    const mod = load({ './db': failing, crypto: { randomBytes } });
+    mod.resetSessionSecretCache();
+    let message = '';
+    try { await mod.getSessionSecret(); } catch (e) { message = e.message; }
+    check('with no key and no database the error names both',
+      /JWT_SECRET/.test(message) && /DATABASE_URL/.test(message), message);
+    check('and it reports the key as unavailable', (await mod.sessionSecretSource()) === 'unavailable');
+  }
+
+  process.env.JWT_SECRET = original;
+}
+
 // ── 8. The front end asks for the right things ───────────────────────────────
 {
   console.log('\n8. The front end and the API agree');
@@ -459,8 +554,13 @@ console.log('\nMZAZI XMD website\n');
   };
   walk(ROOT);
 
+  // This file is the one place that must contain strings shaped like secrets, in
+  // order to test that they are handled. Named explicitly rather than skipped by
+  // directory, so a real secret committed anywhere else is still caught.
+  const SELF = path.join(ROOT, 'scripts', 'test-site.js');
   const risky = [];
   for (const file of files) {
+    if (file === SELF) continue;
     const src = fs.readFileSync(file, 'utf8');
     if (/postgres(ql)?:\/\/[^\s"'$]+:[^\s"'$]+@/i.test(src)) risky.push(`${path.relative(ROOT, file)}: connection string`);
     if (/JWT_SECRET\s*[:=]\s*["'][^"']{6,}/.test(src)) risky.push(`${path.relative(ROOT, file)}: jwt secret`);
