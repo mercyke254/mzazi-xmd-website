@@ -4,9 +4,10 @@ The pairing site for **MZAZI XMD**, the WhatsApp bot. Built with Next.js 14 (App
 Router), React 18 and Tailwind, sharing the design system of the main MZAZI TECH
 site so the two read as one product.
 
-It is a **front end**. It has no database, no bot key and no session secret — it
-forwards the calls it needs to the live platform API. That is the whole design,
-and it is why pairing here is the same pairing as everywhere else.
+It has its own API routes and talks to the **platform's Neon database directly**.
+Same `users` table, same `bot_control` pairing queue, same session cookie — so an
+account and a pairing are interchangeable between this site, mzazi.shop and the
+Telegram bot. There is no API to call and no second database to keep in step.
 
 ---
 
@@ -18,7 +19,7 @@ and it is why pairing here is the same pairing as everywhere else.
 | `/link-bot` | Sign in, pair a number, see the code, manage and unlink devices |
 | `/how-to-use` | The full walkthrough, first commands, group tools, device management |
 | `/faq` | Ten questions, answered |
-| `/contact` | WhatsApp, Telegram, email and a contact form |
+| `/contact` | WhatsApp, Telegram, email and a contact form that stores the message |
 | `/developers` | The team, the developers, the public repositories, partners |
 | `/privacy` · `/terms` | Legal — written for what this site and bot actually do |
 | `/robots.txt` · `/sitemap.xml` | Generated from the same navigation the menu uses |
@@ -32,44 +33,58 @@ without JavaScript and visible to a crawler.
 ## How pairing works
 
 ```
-browser                this site                     MZAZI platform API
-  │                       │                                  │
-  ├─ POST /api/auth/login ─┤                                  │
-  │                       ├─ POST /api/auth/login ───────────►│
-  │                       │◄── 200 + Set-Cookie: token ───────┤
-  │◄── Set-Cookie: token ─┤   (Domain stripped, so the       │
-  │    first-party here   │    cookie belongs to THIS origin)│
-  │                       │                                  │
-  ├─ POST /api/pair ──────┤                                  │
-  │                       ├─ POST /api/pair (Cookie: token) ─►│  queues a `pair`
-  │                       │◄── { requestId } ────────────────┤  row; the bot picks
-  │◄── { requestId } ─────┤                                  │  it up and writes
-  │                       │                                  │  the code back
-  ├─ GET /api/pair?… ─────┤                                  │
-  │                       ├─ GET /api/pair?requestId= ───────►│
-  │◄── { status, code } ──┤◄──────────────────────────────────┤
+browser                 this site                      Neon (shared)        bot
+  │                        │                               │                 │
+  ├─ POST /api/auth/login ─┤                               │                 │
+  │                        ├─ SELECT … FROM users ────────►│                 │
+  │                        │◄── the row, bcrypt checked ────┤                 │
+  │◄── Set-Cookie: token ──┤   (signed with JWT_SECRET, and │                │
+  │                        │    verified against the same   │                │
+  │                        │    users table)                │                │
+  │                        │                               │                 │
+  ├─ POST /api/pair ───────┤                               │                 │
+  │                        ├─ is the bot online? ──────────►│                 │
+  │                        ├─ INSERT bot_control ─────────►│                 │
+  │◄── { requestId } ──────┤   action=pair, status=pending │                 │
+  │                        │                               │◄─ claims it ────┤
+  │                        │                               │   asks WhatsApp │
+  │                        │                               │◄─ writes code ──┤
+  ├─ GET /api/pair?id=─────┤                               │                 │
+  │                        ├─ SELECT … bot_control ───────►│                 │
+  │◄── { status, code } ───┤◄──────────────────────────────┤                 │
 ```
 
-`app/api/[...path]/route.js` is the only backend this repo has. Three things about
-it matter:
+The bot is the only thing that can talk to WhatsApp, so the API's job is to leave
+the request where the bot will find it — and only when a bot exists that can take
+it. Everything that decides that is read from the database rather than assumed:
 
-1. **It is an allowlist.** Only the endpoint/method pairs listed in that file are
-   forwarded; anything else is a 404 before a request leaves the server. A
-   catch-all that forwarded anything would be an open proxy.
-2. **It re-issues the session cookie for this domain.** The platform sets `token`
-   for mzazi.shop, and a browser discards a cookie whose Domain is not the host
-   that answered — so the Domain attribute is stripped and the cookie becomes
-   first-party here. This is the single detail that makes signing in work, and it
-   is unit-tested in `scripts/test-site.js`.
-3. **Only the token cookie is forwarded**, never the browser's whole cookie jar.
+- **Which bots exist** comes from the `bot_profiles` setting the bot itself reads.
+  With one bot there is nothing to choose; with two, a pairing must name one,
+  because the code has to come from a specific bot.
+- **Whether a bot is up** comes from the `bot_status` telemetry each bot
+  publishes, checked *before* the row is inserted. A request queued for an offline
+  bot would sit there until it expired.
+- **Which bot holds a number** comes from that same telemetry, so an unlink goes to
+  the bot that can actually act on it. Sent to the other one it would find no such
+  session and leave the device linked.
 
-### Why the sign-in form is on this site
+`lib/bots.js` is a deliberate copy of the platform's — see the note in that file.
 
-Signing in on mzazi.shop would not authenticate anything here: that cookie belongs
-to that domain and is never sent to this one. So `/link-bot` carries its own email
-and password form, which forwards the credentials to the platform API to be
-verified. The account is the same account — creation, plans and the wallet stay on
-mzazi.shop on purpose, so there is one source of truth for each.
+## Accounts and sessions
+
+One account, both sites. The sign-in form here checks the password against the
+same `users` row mzazi.shop checks, and issues the same cookie: name `token`, JWT
+claims `{ userId, email }`, seven days, `httpOnly`, `SameSite=Lax`.
+
+**`JWT_SECRET` must be the same value on both deployments.** That is what makes a
+session issued on one site understood by the other, and it is the only shared
+secret this site needs.
+
+The form is here rather than a link to mzazi.shop because a cookie belongs to a
+domain: a session created there is never sent to this one. Signing in here mints
+this site's own cookie against the same account — so the credentials, the devices
+and the plan are all the same, while account creation, plans and the wallet stay
+on the main site, one source of truth each.
 
 ---
 
@@ -83,62 +98,107 @@ npm run dev                  # http://localhost:3000
 
 | Variable | Purpose |
 |---|---|
-| `MZAZI_API_BASE` | The platform API to forward to. Point at staging to test against staging. |
-| `NEXT_PUBLIC_SITE_URL` | This site's public address — canonical URLs, sitemap, shares. |
+| `DATABASE_URL` | The platform's Neon connection string — the same database mzazi.shop and the bots use. Copy it from the Neon dashboard's connection details. |
+| `JWT_SECRET` | The session secret. **The same value as the platform's**, or sessions will not be shared. `openssl rand -base64 32` generates one. |
+| `NEXT_PUBLIC_SITE_URL` | This site's public address — canonical URLs, the sitemap, shares. |
 | `NEXT_PUBLIC_MZAZI_SITE` | The main site, for account creation and plans. |
 
-`MZAZI_API_BASE` is read server-side only. Nothing in the browser needs it, and no
-secret of any kind belongs in this repository — `scripts/test-site.js` fails the
-build-time check if one appears.
+Only the two `NEXT_PUBLIC_` values are readable by the browser, and neither is a
+secret. `DATABASE_URL` and `JWT_SECRET` are server-only, are read in exactly one
+place each (`lib/db.js`, `lib/session.js`), and never appear in `lib/site.js` —
+which client components import.
+
+### `GET /api/health`
+
+The first thing to open after deploying, and the whole diagnosis for "why can I
+not sign in". It reports whether each variable is **set** (never its value),
+whether the database answered, and which tables it found:
+
+```json
+{ "ok": true,
+  "config": { "databaseUrl": "set", "jwtSecret": "set", "nodeEnv": "production" },
+  "database": { "reachable": true, "name": "neondb" },
+  "tables": { "auth": { "present": ["users","bot_control","bot_status","settings"], "missing": [] } },
+  "verdict": "Sign-in and pairing should both work." }
+```
+
+A missing `users` table means `DATABASE_URL` points at a new Neon project rather
+than the platform database, and it says so.
 
 ---
 
 ## Checking it
 
 ```bash
-npm run test     # 68 assertions, no network, no database
+npm run test     # 113 assertions, no network, no database
 npm run build    # compiles and type-checks every route
 ```
 
-`scripts/test-site.js` executes the real modules rather than grepping them, and
-covers the things that break quietly:
+`scripts/test-site.js` executes the real modules with their boundaries replaced by
+doubles: a fake Neon client that records the SQL, and a fake cookie store that
+records what a session writes. So what is asserted is what this code says to the
+database and the browser — which is where a mismatch with the platform would hide.
+It covers:
 
-- every menu and footer link resolves to a page that exists
-- the API allowlist still refuses unlisted endpoints and methods
-- the cookie rewrite strips Domain, keeps HttpOnly and Max-Age, drops Secure over
-  http, and emits no attribute twice
-- no database URL, session secret, API key or token is committed
-- every page the brief asked for is present
+- **the session cookie**: its name, attributes, seven-day life, and that the JWT
+  carries `userId` and `email` — the claims the platform's own routes read
+- **the pairing queue**: that an insert writes `action='pair'`, `status='pending'`
+  and a payload carrying the number and account; that an unnamed request stays
+  untargeted so any bot may claim it; that a request is only readable by the
+  account that made it
+- **plan and device limits**: FREE with one device by default, an expired
+  subscription falling back to FREE, and unlinked sessions not occupying a slot
+- **bot resolution**: one bot versus several, an unknown name refused, a bot that
+  has never reported telemetry never counted as online
+- **throttling**: ten sign-in attempts allowed, the eleventh refused
+- **every internal link** resolving to a page that exists, and no connection
+  string, secret or token anywhere in the repository
 
 ---
 
 ## Editing what the site says
 
-Almost all copy lives in **`lib/site.js`** — the navigation, the contact details,
-the features, the five pairing steps and the FAQ. Renaming a menu item or
-correcting the support number is a one-line edit there, and the sitemap, the
-footer and the contact page all follow it.
+Almost all copy lives in **`lib/site.js`** — navigation, contact details, features,
+the five pairing steps and the FAQ. Renaming a menu item or correcting the support
+number is a one-line edit, and the sitemap, the footer and the contact page follow
+it.
 
-The one number worth knowing: the home page's command counts are counted from the
-registry the bot actually serves, not invented. If the pack changes size, update
-`COMMAND_GROUPS` in `app/page.js`.
+The home page's command counts are counted from the registry the bot actually
+serves, not invented. If the pack changes size, update `COMMAND_GROUPS` in
+`app/page.js`.
 
 ---
 
 ## Deploying
 
-Anywhere that runs Next.js. On Vercel: import the repository, set the three
-environment variables, and deploy — there is nothing else to provision, because
-the database and the bot stay where they are.
+Anywhere that runs Next.js. On Vercel: import the repository, set the four
+environment variables, deploy. Nothing else to provision — the database and the bot
+stay where they are.
 
-Once it is up, worth doing:
+Then, in order:
 
-1. Point `NEXT_PUBLIC_SITE_URL` at the real domain, so the sitemap and shares are
-   correct.
-2. Serve it over HTTPS. The session cookie is marked `Secure` when the request
-   arrives over https, and the pairing code is worth protecting.
-3. If the platform API restricts origins, this site does not need adding — every
-   call is made server to server, not from the browser.
+1. **Open `/api/health`.** It should say `ok: true`. If it does not, it names the
+   one thing that is wrong.
+2. **Sign in** on `/link-bot` with a real account. You should see your devices.
+3. **Pair a number** with a bot running. The code should appear within about
+   fifteen seconds.
+4. Point `NEXT_PUBLIC_SITE_URL` at the real domain so the sitemap and shares are
+   correct, and serve the site over HTTPS — the session cookie is marked `Secure`
+   in production, and a pairing code is worth protecting.
+
+---
+
+## Two things worth knowing
+
+**The contact form stores messages; the platform's does not.** mzazi.shop's
+`/api/contact` only logs the submission and answers "success", so a message sent
+from there is gone when the instance recycles. This site's writes to the
+`inquiries` table the admin panel reads — attached to the account when the visitor
+is signed in, and with `user_id` null when they are not, so a person asking a
+question does not have to register first.
+
+**Buying a plan stays on the main site.** The panel shows the current plan and the
+device limit, and links out for upgrades, so pricing lives in one place.
 
 ---
 

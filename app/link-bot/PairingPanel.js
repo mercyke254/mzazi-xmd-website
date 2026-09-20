@@ -153,10 +153,17 @@ export default function PairingPanel() {
       const d = await res.json().catch(() => ({}));
 
       if (!res.ok) {
+        // A 5xx is the deployment's problem, not this person's password. Saying so
+        // — and naming the endpoint that reports which setting is wrong — is the
+        // difference between a dead end and a one-line fix, which is exactly what
+        // a misconfigured database looked like from this form.
+        const serverProblem = res.status >= 500;
         setLoginError(
-          res.status === 429
-            ? 'Too many attempts just now. Please wait a minute and try again.'
-            : humaniseError(d.error || 'Check your email and password.')
+          serverProblem
+            ? `${humaniseError(d.error, 'This deployment has a problem signing anyone in.')} Open /api/health to see which setting is missing.`
+            : res.status === 429
+              ? 'Too many attempts just now. Please wait a minute and try again.'
+              : humaniseError(d.error || 'Check your email and password.')
         );
         return;
       }

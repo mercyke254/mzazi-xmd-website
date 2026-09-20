@@ -1,18 +1,24 @@
 #!/usr/bin/env node
 // ─────────────────────────────────────────────────────────────────────────────
-// Checks on the things that are easy to break and hard to notice: a nav item
-// pointing at a page that does not exist, a bridge that forwards a path it should
-// not, a cookie rewrite that silently stops working and signs everybody out.
+// Checks on the things that break quietly.
 //
-// The modules under test are ES modules in a CommonJS package (Next compiles them,
-// plain node cannot require them), so the source is read and executed here rather
-// than the behaviour being grepped for. These are the real implementations.
+// The modules under test are ES modules in a CommonJS package (Next compiles
+// them, plain node cannot require them) and the interesting ones talk to a
+// database. So each is read and executed here with its boundary replaced by a
+// double: a fake Neon client that records the SQL it is handed, and a fake cookie
+// store that records what a session writes. What is being checked is therefore
+// what THIS code says to the database and the browser — the SQL, the parameters
+// and the cookie attributes — which is exactly where a mismatch with the platform
+// would hide.
+//
 //   node scripts/test-site.js
 // ─────────────────────────────────────────────────────────────────────────────
 const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret-used-only-by-this-file';
+
 let passed = 0;
 const failures = [];
 
@@ -21,64 +27,118 @@ function check(name, condition, detail = '') {
   else { failures.push(`${name}${detail ? ` — ${detail}` : ''}`); console.log(`  ❌ ${name}${detail ? `\n       ${detail}` : ''}`); }
 }
 
-/** Execute an ESM source file's body and hand back the exports named in `pick`. */
-function loadEsm(relative, pick) {
+/**
+ * Execute an ESM source file's body and hand back the exports named in `pick`.
+ *
+ * Relative imports are bound from `deps` rather than resolved, so a file gets the
+ * real implementation of what it imports (pass it in) and a clear error if a new
+ * import appears that the caller has not provided — which is how a change to the
+ * wiring is noticed here instead of in production.
+ */
+function loadEsm(relative, pick, deps = {}) {
   const src = fs.readFileSync(path.join(ROOT, relative), 'utf8');
   const body = src
-    .replace(/^\s*import[^;]*;\s*$/gm, '')   // strip imports: nothing here needs them
+    // Default import: `import jwt from 'jsonwebtoken'`. A CommonJS package has no
+    // .default, so the module itself is the value in that case.
+    .replace(
+      /^\s*import\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"];?\s*$/gm,
+      (m, name, spec) => `const ${name} = (__dep(${JSON.stringify(spec)}).default !== undefined ? __dep(${JSON.stringify(spec)}).default : __dep(${JSON.stringify(spec)}));`
+    )
+    .replace(
+      /^\s*import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"];?\s*$/gm,
+      (m, names, spec) => `const { ${names} } = __dep(${JSON.stringify(spec)});`
+    )
+    .replace(/^\s*import[^;]*;\s*$/gm, '')
     .replace(/^\s*export\s+default\s+/gm, '')
     .replace(/^\s*export\s+/gm, '');
   const shim = { exports: {} };
+  const __dep = (spec) => {
+    if (!(spec in deps)) {
+      throw new Error(`${relative} imports "${spec}" — pass it in deps to loadEsm()`);
+    }
+    return deps[spec];
+  };
   // eslint-disable-next-line no-new-func
-  const fn = new Function('module', 'exports', 'require', 'process',
+  const fn = new Function('module', 'exports', 'require', 'process', '__dep',
     `${body}\nmodule.exports = { ${pick.join(', ')} };`);
-  fn(shim, shim.exports, require, process);
+  fn(shim, shim.exports, require, process, __dep);
   return shim.exports;
 }
 
-function exists(relative) {
-  return fs.existsSync(path.join(ROOT, relative));
+/**
+ * A Neon client that answers from `handler` and records every query.
+ * `db()` is called as a tagged template, so this returns that shape.
+ */
+function fakeDb(handler = () => []) {
+  const calls = [];
+  const sql = async (strings, ...values) => {
+    const query = strings.join(' ? ');
+    calls.push({ query, values });
+    return handler(query, values, calls) || [];
+  };
+  return {
+    calls,
+    sql,
+    module: {
+      db: () => sql,
+      hasDatabaseUrl: () => true,
+      ConfigError: class ConfigError extends Error {
+        constructor(message) { super(message); this.name = 'ConfigError'; this.isConfig = true; }
+      },
+    },
+  };
 }
 
+const exists = (relative) => fs.existsSync(path.join(ROOT, relative));
+const read = (relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8');
+
+const envModule = () => loadEsm('lib/env.js', ['cleanEnvValue', 'normaliseUrl']);
+
+// The body below uses await — several of the modules under test are async — so
+// it all runs inside one async function rather than at the top level, which would
+// make this file ambiguous between CommonJS and ESM.
+async function main() {
 console.log('\nMZAZI XMD website\n');
 
-// ── 1. The navigation the brief specified ────────────────────────────────────
+// ── 1. Navigation, footer and contact details ────────────────────────────────
 {
   console.log('1. Navigation, footer and contact details');
-  const { site } = loadEsm('lib/site.js', ['site']);
+  const { site } = loadEsm('lib/site.js', ['site'], { './env': envModule() });
 
   const labels = site.nav.map((l) => l.label);
   for (const required of ['Home', 'Link Bot', 'How to Use', 'FAQ', 'Contact']) {
     check(`the menu has ${required}`, labels.includes(required), labels.join(', '));
   }
-  check('the menu is one list used by the drawer and the footer',
+  check('the drawer and the footer carry the same links',
     JSON.stringify(site.nav.map((l) => l.href)) === JSON.stringify(site.footerNav.map((l) => l.href)));
   check('the footer carries a privacy policy', site.legalNav.some((l) => l.href === '/privacy'));
   check('the footer carries terms', site.legalNav.some((l) => l.href === '/terms'));
   check('there is a developers page in the menu', labels.includes('Developers & Friends'));
-  check('the support number is the real one', site.contact.whatsapp === '254108595201', site.contact.whatsapp);
-  check('the support email is the real one', site.contact.email === 'mzazitechinc@gmail.com', site.contact.email);
+  check('the support number is the real one', site.contact.whatsapp === '254108595201');
+  check('the support email is the real one', site.contact.email === 'mzazitechinc@gmail.com');
   check('the FAQ has answers to give', site.faq.length >= 8, String(site.faq.length));
-  check('the walkthrough has five steps', site.steps.length === 5, String(site.steps.length));
-  check('every feature names an icon that exists', site.features.every((f) => typeof f.icon === 'string'));
+  check('the walkthrough has five steps', site.steps.length === 5);
+
+  // The apiBase fields are gone with the proxy: nothing here should still be
+  // reaching for a remote API the site no longer has.
+  check('the site config no longer describes a remote API',
+    !('apiBase' in site) && !('apiBaseRaw' in site));
 }
 
-// ── 2. Every link in the menu reaches a real page ────────────────────────────
+// ── 2. Every link reaches a real page ────────────────────────────────────────
 {
   console.log('\n2. Links resolve to pages that exist');
-  const { site } = loadEsm('lib/site.js', ['site']);
+  const { site } = loadEsm('lib/site.js', ['site'], { './env': envModule() });
   const pageFor = (href) => (href === '/' ? 'app/page.js' : `app${href}/page.js`);
 
   for (const l of [...site.nav, ...site.legalNav]) {
-    check(`  ${l.href} → ${pageFor(l.href)}`, exists(pageFor(l.href)));
+    check(`  ${l.href}`, exists(pageFor(l.href)));
   }
 
-  // Any other internal link written in the source has to resolve too — this is
-  // how a footer or a body link to a page that was never created gets caught.
   const files = [];
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === 'node_modules' || entry.name === '.next' || entry.name === '.git') continue;
+      if (['node_modules', '.next', '.git'].includes(entry.name)) continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
       else if (/\.(js|jsx)$/.test(entry.name)) files.push(full);
@@ -89,74 +149,312 @@ console.log('\nMZAZI XMD website\n');
 
   const internal = new Set();
   for (const file of files) {
-    const src = fs.readFileSync(file, 'utf8');
-    for (const m of src.matchAll(/href=["'](\/[a-z0-9-]*)["']/gi)) internal.add(m[1]);
-    for (const m of src.matchAll(/href=["']\$\{site\.accountBase\}(\/[a-z0-9-]*)["']/gi)) internal.add(`~external${m[1]}`);
+    for (const m of read(path.relative(ROOT, file)).matchAll(/href=["'](\/[a-z0-9-]*)["']/gi)) internal.add(m[1]);
   }
-
-  const missing = [...internal].filter((href) => href !== '/' && !href.startsWith('~') && !exists(`app${href}/page.js`));
+  const missing = [...internal].filter((href) => href !== '/' && !exists(`app${href}/page.js`));
   check('no internal link points at a missing page', missing.length === 0, missing.join(', '));
 }
 
-// ── 3. The bridge ────────────────────────────────────────────────────────────
+// ── 3. Sessions match the platform's ─────────────────────────────────────────
 {
-  console.log('\n3. The bridge to the platform API');
-  const route = fs.readFileSync(path.join(ROOT, 'app/api/[...path]/route.js'), 'utf8');
+  console.log('\n3. A session issued here is the one the platform expects');
+  const jwt = require('jsonwebtoken');
 
-  // The allowlist is the security boundary: without it this route is an open
-  // proxy that lets anyone reach the platform API from this origin.
-  const allowBlock = route.match(/const ALLOWED = \{([\s\S]*?)\n\};/);
-  check('the bridge has an allowlist', !!allowBlock);
-  const list = allowBlock ? allowBlock[1] : '';
-  for (const endpoint of ['auth/login', 'auth/logout', 'auth/me', 'pair', 'pair/bots', 'pair/devices', 'pair/plan', 'pair/unlink', 'contact']) {
-    check(`  ${endpoint} is allowed`, list.includes(`'${endpoint}'`));
+  const written = [];
+  const cookiesStub = {
+    cookies: async () => ({
+      get: () => undefined,
+      set: (name, value, options) => written.push({ name, value, options }),
+    }),
+  };
+  const fake = fakeDb();
+  const { startSession, endSession, sessionClaims } =
+    loadEsm('lib/session.js', ['startSession', 'endSession', 'sessionClaims'], {
+      'jsonwebtoken': jwt,
+      'next/headers': cookiesStub,
+      './db': fake.module,
+    });
+
+  const user = { id: 42, email: 'demo@example.com' };
+  const token = await startSession(user);
+  const cookie = written[0];
+
+  check('the cookie is called "token"', cookie?.name === 'token', cookie?.name);
+  check('it is httpOnly', cookie?.options?.httpOnly === true);
+  check('it is SameSite=Lax', cookie?.options?.sameSite === 'lax');
+  check('it is scoped to /', cookie?.options?.path === '/');
+  check('it lives for seven days', cookie?.options?.maxAge === 7 * 24 * 60 * 60, String(cookie?.options?.maxAge));
+
+  // The claim names are what the platform's routes read (`decoded.userId`), so
+  // they are asserted rather than assumed.
+  const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  check('the token carries userId', decoded.userId === 42, JSON.stringify(decoded));
+  check('the token carries the email', decoded.email === 'demo@example.com');
+  check('it expires in a week', Math.round((decoded.exp - decoded.iat) / 86400) === 7);
+
+  await endSession();
+  const cleared = written[written.length - 1];
+  check('signing out expires the cookie', cleared?.value === '' && cleared?.options?.maxAge === 0);
+
+  // Nothing readable means no session: absent, forged or expired.
+  const { sessionClaims: claimsWithBadCookie } = loadEsm('lib/session.js', ['sessionClaims'], {
+    'jsonwebtoken': jwt,
+    'next/headers': { cookies: async () => ({ get: () => ({ value: 'not.a.jwt' }) }) },
+    './db': fake.module,
+  });
+  check('a forged cookie is not a session', (await claimsWithBadCookie()) === null);
+
+  const { sessionClaims: claimsWithoutCookie } = loadEsm('lib/session.js', ['sessionClaims'], {
+    'jsonwebtoken': jwt,
+    'next/headers': { cookies: async () => ({ get: () => undefined }) },
+    './db': fake.module,
+  });
+  check('no cookie is not a session', (await claimsWithoutCookie()) === null);
+}
+
+// ── 4. The pairing queue ─────────────────────────────────────────────────────
+{
+  console.log('\n4. The pairing queue the bot polls');
+  const { normalizeNumber, queuePair, pendingPairFor, pairingRequest, planAndDevices } =
+    loadEsm('lib/pair.js', ['normalizeNumber', 'queuePair', 'pendingPairFor', 'pairingRequest', 'planAndDevices'], {
+      './db': fakeDb().module,
+    });
+
+  check('a normal number is accepted', normalizeNumber('254785016388') === '254785016388');
+  check('+ and spaces are stripped', normalizeNumber('+254 785 016 388') === '254785016388');
+  check('dashes are stripped', normalizeNumber('254-785-016-388') === '254785016388');
+  check('a short number is refused', normalizeNumber('12345') === null);
+  check('an absurdly long number is refused', normalizeNumber('1'.repeat(20)) === null);
+  check('nothing at all is refused', normalizeNumber('') === null && normalizeNumber(null) === null);
+
+  // The insert is what the bot reads, so its columns and payload are checked.
+  {
+    const fake = fakeDb(() => [{ id: 77 }]);
+    const { queuePair: queue } = loadEsm('lib/pair.js', ['queuePair'], { './db': fake.module });
+    const row = await queue({ number: '254785016388', accountId: 42, botId: 'xmd', named: true });
+
+    check('the queue insert returns the row id', row?.id === 77, JSON.stringify(row));
+    const insert = fake.calls.find((c) => /INSERT INTO bot_control/.test(c.query));
+    check('it writes a pair action', /'pair'/.test(insert?.query || ''));
+    check('it writes status pending', /'pending'/.test(insert?.query || ''));
+    const payload = insert?.values?.find((v) => typeof v === 'string' && v.includes('accountId'));
+    check('the payload carries the number and the account',
+      !!payload && JSON.parse(payload).number === '254785016388' && JSON.parse(payload).accountId === 42,
+      String(payload));
+    check('a named bot is targeted', insert?.values?.includes('xmd'), JSON.stringify(insert?.values));
   }
-  check('a path that is not listed is refused', /if \(!allowedMethods\)/.test(route) && /status: 404/.test(route));
-  check('a method that is not listed is refused', /Method \$\{method\} not allowed/.test(route) && /status: 405/.test(route));
-  check('only the token cookie is forwarded, not the whole cookie jar', /headers\.cookie = `token=\$\{token\}`/.test(route));
-  check('an unreachable API is a 502, not a crash', /status: 502/.test(route));
-  check('the upstream call is bounded by a timeout', /AbortSignal\.timeout/.test(route));
+
+  {
+    // An unnamed request must stay claimable by any bot — the behaviour that
+    // existed before bots were selectable.
+    const fake = fakeDb(() => [{ id: 78 }]);
+    const { queuePair: queue } = loadEsm('lib/pair.js', ['queuePair'], { './db': fake.module });
+    await queue({ number: '254785016388', accountId: 42, botId: 'xmd', named: false });
+    const insert = fake.calls.find((c) => /INSERT INTO bot_control/.test(c.query));
+    check('an unnamed request is not targeted at a bot', insert?.values?.includes(''), JSON.stringify(insert?.values));
+  }
+
+  {
+    const fake = fakeDb(() => [{ id: 5 }]);
+    const { pendingPairFor: pending } = loadEsm('lib/pair.js', ['pendingPairFor'], { './db': fake.module });
+    await pending(42);
+    const q = fake.calls[0].query;
+    check('the in-progress check filters on the account', /payload->>'accountId'/.test(q));
+    check('it looks at pending and claimed rows', /pending/.test(q) && /claimed/.test(q));
+  }
+
+  {
+    const fake = fakeDb(() => [{ id: 5, status: 'done' }]);
+    const { pairingRequest: req } = loadEsm('lib/pair.js', ['pairingRequest'], { './db': fake.module });
+    await req(5, 42);
+    check('a request is only readable by the account that made it',
+      /payload->>'accountId'/.test(fake.calls[0].query) && fake.calls[0].values.includes('42'));
+  }
+
+  {
+    // The plan and the limit decide whether the panel offers another pairing, so
+    // the defaults and the ACTIVE-only device filter are both checked.
+    const noSub = fakeDb(() => []);
+    const { planAndDevices: planOf } = loadEsm('lib/pair.js', ['planAndDevices'], { './db': noSub.module });
+    const free = await planOf(1);
+    check('no subscription is FREE with one device', free.plan === 'FREE' && free.maxDevices === 1);
+
+    const expired = fakeDb((q) => (/FROM "Subscription"/.test(q)
+      ? [{ plan: 'PLAN_10', maxDevices: 10, endDate: '2020-01-01', status: 'ACTIVE' }]
+      : []));
+    const { planAndDevices: planOf2 } = loadEsm('lib/pair.js', ['planAndDevices'], { './db': expired.module });
+    const after = await planOf2(1);
+    check('an expired subscription falls back to FREE', after.plan === 'FREE' && after.maxDevices === 1);
+
+    const active = fakeDb((q) => (/FROM "Subscription"/.test(q)
+      ? [{ plan: 'PLAN_10', maxDevices: 10, endDate: '2099-01-01', status: 'ACTIVE' }]
+      : []));
+    const { planAndDevices: planOf3 } = loadEsm('lib/pair.js', ['planAndDevices'], { './db': active.module });
+    const live = await planOf3(1);
+    check('an active subscription sets the limit', live.plan === 'PLAN_10' && live.maxDevices === 10);
+
+    const deviceQuery = active.calls.find((c) => /WhatsAppSession/.test(c.query));
+    check('unlinked sessions do not occupy a device slot',
+      /status = 'ACTIVE'/.test(deviceQuery?.query || ''), deviceQuery?.query);
+  }
 }
 
-// ── 4. The cookie rewrite, executed ──────────────────────────────────────────
+// ── 5. Which bot takes the request ───────────────────────────────────────────
 {
-  console.log('\n4. Sign-in works across domains');
-  const { rewriteCookie, isClearingCookie } = loadEsm('lib/proxyCookie.js', ['rewriteCookie', 'isClearingCookie']);
+  console.log('\n5. Which bot takes the request');
+  const settings = (profiles, name = 'MZAZI XMD') =>
+    fakeDb((q) => {
+      if (/FROM settings/.test(q)) {
+        return [
+          { key: 'bot_profiles', value: profiles },
+          { key: 'bot_name', value: name },
+        ];
+      }
+      if (/FROM bot_status/.test(q)) return [];
+      return [];
+    });
 
-  const upstream = 'token=abc.def.ghi; Domain=.mzazi.shop; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800';
-  const https = rewriteCookie(upstream, { isHttps: true });
-  check('the Domain is stripped, or the browser would discard the cookie', !/domain/i.test(https), https);
-  check('the value is kept', https.startsWith('token=abc.def.ghi'), https);
-  check('it stays HttpOnly', /HttpOnly/i.test(https));
-  check('it keeps its lifetime', /Max-Age=604800/.test(https));
-  check('it is scoped to this origin', /Path=\//.test(https));
-  check('it is Secure over https', /Secure/.test(https));
-  check('it is SameSite=Lax so the redirect back works', /SameSite=Lax/i.test(https));
-  // A duplicated attribute is a smell that the upstream's own copy survived the
-  // rewrite — which is exactly what happened before this was moved out of the
-  // route, and it was the running build that showed it.
-  check('no cookie attribute is emitted twice',
-    (https.match(/samesite/gi) || []).length === 1 &&
-    (https.match(/\bpath=/gi) || []).length === 1, https);
+  const { listBots, resolveBot, statusFor } = loadEsm(
+    'lib/bots.js', ['listBots', 'resolveBot', 'statusFor'], { './db': settings('') .module }
+  );
 
-  const http = rewriteCookie(upstream, { isHttps: false });
-  check('Secure is dropped on http, or local development cannot sign in', !/Secure/.test(http));
+  const single = await listBots();
+  check('with no profiles configured there is one bot', single.length === 1, JSON.stringify(single));
+  check('and it is named from the settings table', single[0].name === 'MZAZI XMD');
 
-  check('a logout cookie is recognised', isClearingCookie('token=; Path=/; Max-Age=0'));
-  check('a session cookie is not mistaken for a logout', !isClearingCookie(upstream));
-  check('logout survives the rewrite as an empty value', rewriteCookie('token=; Path=/; Max-Age=0', { isHttps: true }).startsWith('token=;'));
+  const anonymous = await resolveBot('');
+  check('an unnamed request resolves to the only bot', anonymous.ok === true && anonymous.named === false);
+
+  const named = await resolveBot('xmd');
+  check('an unknown bot name is refused', named.ok === false && !!named.error, JSON.stringify(named));
+
+  const two = settings(JSON.stringify([{ id: 'xmd', name: 'MZAZI XMD' }, { id: 'quartz', name: 'QUARTZ XD' }]));
+  const { resolveBot: resolveTwo } = loadEsm('lib/bots.js', ['resolveBot'], { './db': two.module });
+  const ambiguous = await resolveTwo('');
+  check('with two bots the caller must choose', ambiguous.ok === false, JSON.stringify(ambiguous));
+  const chosen = await resolveTwo('quartz');
+  check('a named bot is honoured', chosen.ok === true && chosen.bot.id === 'quartz' && chosen.named === true);
+
+  // Telemetry decides whether a pairing can even be queued.
+  const online = fakeDb((q) => (/FROM bot_status/.test(q) ? [{ bot_id: 'xmd', online: true }] : []));
+  const { statusFor: statusOnline } = loadEsm('lib/bots.js', ['statusFor'], { './db': online.module });
+  check('a reporting bot is seen as online', (await statusOnline('xmd'))?.online === true);
+
+  const silent = fakeDb(() => []);
+  const { statusFor: statusSilent } = loadEsm('lib/bots.js', ['statusFor'], { './db': silent.module });
+  check('a bot that never reported is not online', (await statusSilent('xmd')) === null);
 }
 
-// ── 5. Nothing secret lives in this repo ─────────────────────────────────────
+// ── 6. Sign-in throttling ────────────────────────────────────────────────────
 {
-  console.log('\n5. No secrets in the front end');
+  console.log('\n6. Sign-in throttling');
+  const { rateLimit, clientIp } = loadEsm('lib/rateLimit.js', ['rateLimit', 'clientIp']);
+
+  const key = `t-${Date.now()}`;
+  let last;
+  for (let i = 0; i < 10; i += 1) last = rateLimit(key, { max: 10, windowMs: 60_000 });
+  check('ten attempts are allowed', last.allowed === true, JSON.stringify(last));
+
+  const eleventh = rateLimit(key, { max: 10, windowMs: 60_000 });
+  check('the eleventh is refused', eleventh.allowed === false);
+  check('and it says how long to wait', eleventh.retryAfterMs > 0);
+
+  // A window that has passed starts over rather than staying locked. The wait is
+  // longer than the window on purpose: with a 1ms window the two calls can land
+  // in the same millisecond and the check would fail at random.
+  const shortKey = `s-${Date.now()}`;
+  rateLimit(shortKey, { max: 1, windowMs: 20 });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const afterWindow = rateLimit(shortKey, { max: 1, windowMs: 20 });
+  check('the window resets', afterWindow.allowed === true);
+
+  const headers = { get: (h) => (h === 'x-forwarded-for' ? '41.90.1.2, 10.0.0.1' : null) };
+  check('the client address comes from the first hop',
+    clientIp({ headers }) === '41.90.1.2', clientIp({ headers }));
+}
+
+// ── 7. Database failures are named ───────────────────────────────────────────
+{
+  console.log('\n7. A database failure explains itself');
+  const { describeDbError } = loadEsm('lib/db.js', ['describeDbError'], {
+    '@neondatabase/serverless': { neon: () => () => Promise.resolve([]) },
+  });
+
+  check('a missing table names the table',
+    describeDbError({ code: '42P01', message: 'relation "users" does not exist' }).reason.includes('users'));
+  check('bad credentials are named',
+    describeDbError({ code: '28P01' }).reason.includes('credentials'));
+  check('a missing database is named',
+    describeDbError({ code: '3D000' }).reason.includes('does not exist'));
+  check('an unreachable host is named',
+    describeDbError({ code: 'ENOTFOUND' }).reason.includes('could not be reached'));
+  check('a configuration error passes its own message through',
+    describeDbError({ isConfig: true, message: 'DATABASE_URL is not set' }).reason.includes('DATABASE_URL'));
+  check('an unknown error still says something', !!describeDbError({}).reason);
+}
+
+// ── 8. The front end asks for the right things ───────────────────────────────
+{
+  console.log('\n8. The front end and the API agree');
+  const panel = read('app/link-bot/PairingPanel.js');
+  const form = read('app/contact/ContactForm.js');
+
+  for (const endpoint of ['/api/auth/login', '/api/auth/me', '/api/pair/devices', '/api/pair/bots', '/api/pair/unlink', '/api/pair?requestId=']) {
+    check(`  the panel calls ${endpoint}`, panel.includes(endpoint));
+  }
+  check('the panel posts a pairing request', /fetch\('\/api\/pair'/.test(panel));
+  check('the contact form posts to the inquiries endpoint', /fetch\('\/api\/contact'/.test(form));
+
+  // The routes those calls land on have to exist, with the right methods.
+  const methods = {
+    'app/api/auth/login/route.js': 'POST',
+    'app/api/auth/logout/route.js': 'POST',
+    'app/api/auth/me/route.js': 'GET',
+    'app/api/pair/route.js': 'POST',
+    'app/api/pair/bots/route.js': 'GET',
+    'app/api/pair/devices/route.js': 'GET',
+    'app/api/pair/unlink/route.js': 'POST',
+    'app/api/contact/route.js': 'POST',
+    'app/api/health/route.js': 'GET',
+  };
+  for (const [file, method] of Object.entries(methods)) {
+    check(`  ${file.replace('app/api/', '').replace('/route.js', '')} exports ${method}`,
+      exists(file) && new RegExp(`export async function ${method}\\b`).test(read(file)));
+  }
+
+  // Every authenticated endpoint must actually check the session.
+  for (const file of ['app/api/pair/route.js', 'app/api/pair/bots/route.js', 'app/api/pair/devices/route.js', 'app/api/pair/unlink/route.js']) {
+    check(`  ${file.split('/')[2]} requires a session`, /sessionClaims\(\)/.test(read(file)));
+  }
+
+  // Anything under components/ can end up in a client bundle, and a secret that
+  // reaches one has leaked. Walked rather than listed so a new component is
+  // covered the day it is added.
+  const clientFiles = [];
+  const walkClient = (dir) => {
+    for (const entry of fs.readdirSync(path.join(ROOT, dir), { withFileTypes: true })) {
+      const rel = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) walkClient(rel);
+      else if (/\.(js|jsx)$/.test(entry.name)) clientFiles.push(rel);
+    }
+  };
+  walkClient('components');
+  const leaked = clientFiles.filter((f) => /process\.env\.(DATABASE_URL|JWT_SECRET)/.test(read(f)));
+  check('no component reads a server-only variable', leaked.length === 0, leaked.join(', '));
+  check('the site config is safe in a client bundle',
+    !/DATABASE_URL|JWT_SECRET/.test(read('lib/site.js')));
+}
+
+// ── 9. No secrets in the repository ──────────────────────────────────────────
+{
+  console.log('\n9. No secrets in the front end');
   const files = [];
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (['node_modules', '.next', '.git'].includes(entry.name)) continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
-      else if (/\.(js|jsx|json|mjs)$/.test(entry.name)) files.push(full);
+      else if (/\.(js|jsx|json|mjs|ts)$/.test(entry.name)) files.push(full);
     }
   };
   walk(ROOT);
@@ -164,19 +462,25 @@ console.log('\nMZAZI XMD website\n');
   const risky = [];
   for (const file of files) {
     const src = fs.readFileSync(file, 'utf8');
-    if (/DATABASE_URL\s*=\s*["']?postgres/i.test(src)) risky.push(`${path.relative(ROOT, file)}: database URL`);
-    if (/JWT_SECRET\s*=\s*["'][^"']+/i.test(src)) risky.push(`${path.relative(ROOT, file)}: jwt secret`);
+    if (/postgres(ql)?:\/\/[^\s"'$]+:[^\s"'$]+@/i.test(src)) risky.push(`${path.relative(ROOT, file)}: connection string`);
+    if (/JWT_SECRET\s*[:=]\s*["'][^"']{6,}/.test(src)) risky.push(`${path.relative(ROOT, file)}: jwt secret`);
     if (/ghp_[A-Za-z0-9]{20,}/.test(src)) risky.push(`${path.relative(ROOT, file)}: github token`);
-    if (/_KEY\s*=\s*["'][A-Za-z0-9]{16,}/.test(src)) risky.push(`${path.relative(ROOT, file)}: api key`);
+    if (/(SECRET_KEY|API_KEY)\s*[:=]\s*["'][A-Za-z0-9]{16,}/.test(src)) risky.push(`${path.relative(ROOT, file)}: key`);
   }
-  check('no database URL, session secret, API key or token is committed', risky.length === 0, risky.join('; '));
-  check('.env is ignored', fs.readFileSync(path.join(ROOT, '.gitignore'), 'utf8').includes('.env'));
-  check('.env.example is committed as the template', exists('.env.example'));
+  check('no connection string, secret or token is committed', risky.length === 0, risky.join('; '));
+
+  const template = read('.env.example');
+  check('.env is ignored', read('.gitignore').includes('.env'));
+  check('.env.example leaves the secret values empty',
+    /^JWT_SECRET=\s*$/m.test(template) && /^DATABASE_URL=\s*$/m.test(template));
+  check('.env.example has no quoted values to copy',
+    template.split('\n').every((l) => !/^[A-Z0-9_]+=.*["']/.test(l.trim())));
+  check('.env.example warns about it anyway', /NO QUOTES/.test(template));
 }
 
-// ── 6. The pieces are all there ──────────────────────────────────────────────
+// ── 10. Every page the brief asked for ───────────────────────────────────────
 {
-  console.log('\n6. Every page the brief asked for');
+  console.log('\n10. Every page the brief asked for');
   const pages = {
     'app/page.js': 'home',
     'app/link-bot/page.js': 'link bot',
@@ -192,8 +496,6 @@ console.log('\nMZAZI XMD website\n');
   check('the hamburger navigation exists', exists('components/Navbar.js'));
   check('the footer exists', exists('components/Footer.js'));
   check('the pairing panel exists', exists('app/link-bot/PairingPanel.js'));
-  check('the contact form posts through the bridge', /fetch\('\/api\/contact'/.test(fs.readFileSync(path.join(ROOT, 'app/contact/ContactForm.js'), 'utf8')));
-  check('the panel polls for the code', /api\/pair\?requestId=/.test(fs.readFileSync(path.join(ROOT, 'app/link-bot/PairingPanel.js'), 'utf8')));
   check('a favicon is provided', exists('app/icon.svg'));
   check('robots and sitemap are generated', exists('app/robots.js') && exists('app/sitemap.js'));
 }
@@ -204,3 +506,9 @@ if (failures.length) {
   console.log('');
   process.exitCode = 1;
 }
+}
+
+main().catch((e) => {
+  console.error('\nharness error:', e);
+  process.exitCode = 1;
+});

@@ -2,7 +2,7 @@
   "name": "mzazi-xmd-website",
   "version": "1.0.0",
   "private": true,
-  "description": "MZAZI XMD — the WhatsApp bot pairing site. Next.js front end for the MZAZI TECH platform.",
+  "description": "MZAZI XMD \u2014 the WhatsApp bot pairing site. Next.js front end for the MZAZI TECH platform.",
   "author": "Mzazi Tech Inc <mzazitechinc@gmail.com>",
   "engines": {
     "node": ">=18.17.0"
@@ -15,6 +15,9 @@
     "test": "node scripts/test-site.js"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^0.10.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
     "next": "^14.2.29",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

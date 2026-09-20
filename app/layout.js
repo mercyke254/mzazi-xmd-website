@@ -43,7 +43,7 @@ const jsonLd = {
   publisher: {
     '@type': 'Organization',
     name: site.legalName,
-    url: site.apiBase,
+    url: site.accountBase,
   },
   sameAs: [site.contact.telegramUrl, site.contact.whatsappUrl],
 };
