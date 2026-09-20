@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="MZAZI XMD">
+  <!-- The same mark the site uses, on the aurora gradient. Next serves any file
+       named icon.svg in app/ as the favicon, so there is no separate asset to
+       keep in step with components/Logo.js. -->
+  <defs>
+    <linearGradient id="xmd-icon-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6D28D9" />
+      <stop offset="52%" stop-color="#DB2777" />
+      <stop offset="100%" stop-color="#2563EB" />
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="64" height="64" rx="15" fill="url(#xmd-icon-bg)" />
+  <path d="M36 8 L19 33 H29 L26 56 L45 27 H34 Z" fill="#ffffff" />
+</svg>
